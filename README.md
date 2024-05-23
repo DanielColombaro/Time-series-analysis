@@ -5,4 +5,4 @@ Forecasting of historical data using R (KFAS and forecast libraries) and Python 
 - Unobserved Components Model (UCM)
 - Deep Learning (RNNs)
 
-In the competition within the class, I obtained the second best score in terms of Mean Absolute Error (MAE).
+The .csv files contain the predicted values for each model.
