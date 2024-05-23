@@ -1,0 +1,872 @@
+---
+title: "Time Series Project Notebook"
+output: html_notebook
+---
+
+#### Importing the dataset
+
+```{r}
+library(KFAS)
+library(xts)
+library(lubridate)
+library(MASS)
+library(forecast)
+
+dt <- read.csv("dataset.csv")
+dt$date = ymd(dt$date)
+```
+
+#### Showing summary statistics of the dataset
+
+```{r}
+require(skimr)
+skim_without_charts(dt)
+```
+
+
+#### Adjusting 0 values to stay within the domain of the logarithm
+
+```{r}
+dt$ave_days[dt$ave_days==0] = NA
+```
+
+
+#### Making the dataset a timeseries object and checking Box Cox function
+
+```{r}
+dtts <- xts(dt$ave_days, 
+            order.by = dt$date, 
+            frequency=365.25)
+```
+
+
+```{r}
+whisker <- 1.5 * IQR(dtts, na.rm=TRUE)
+```
+
+
+```{r}
+means <- tapply(dtts,
+                rep(1:3009, each = 7)[1:length(dtts)], #ragruppiamo le variabili per settimane
+                mean, na.rm = TRUE) #su ogni settimana calcola la media
+
+stdevs <- tapply(dtts,
+                rep(1:3009, each = 7)[1:length(dtts)],
+                sd, na.rm = TRUE) #su ogni settimana calcola la dev standard
+
+plot(means, stdevs)
+abline(lm(stdevs~means))
+```
+
+We can approximate the value by taking a log transformation.
+
+#### Cheking ACF and PACF
+
+```{r}
+acf(log(dtts), lag.max=90, na.action= na.contiguous, main='ACF')
+pacf(log(dtts), lag.max=90, na.action= na.contiguous, main='PACF')
+```
+
+
+
+#### Removal of outliers beyond whiskers
+
+
+```{r}
+for (i in seq_along(dtts)) {
+  dtts[i] <- ifelse(dtts[i]>whisker, NA, dtts[i])
+}
+
+```
+
+#### Splitting into training and test set
+
+```{r}
+dtts_training = dtts
+dtts_training[(floor(length(dtts)*0.75)+1):length(dtts)] <- NA
+start_date = dt$date[1]
+start_date
+days_to_add = floor(length(dtts)*0.75)
+train_date = start_date + days_to_add
+train_date
+
+dtts_test = dtts[(days_to_add+1):length(dtts)]
+
+```
+
+#### Constructing state-space model
+
+```{r}
+var_ldtts <- var(na.omit(log(dtts_training)))
+
+
+mod1 <- SSModel(
+  log(dtts_training) ~ SSMtrend(2, list(NA, NA)) +
+    SSMseasonal(7, NA),
+  H = NA
+)
+
+```
+
+
+#### Fitting the first model
+
+```{r}
+fit1 <- fitSSM(
+  model = mod1,
+  inits= rep(log(var_ldtts), 4)
+)
+
+fit1$optim.out
+
+```
+
+#### Smoothing with Karman smoother
+
+```{r}
+# smoothing
+smo1 <- KFS(fit1$model,
+  smoothing = c("state", "signal", "disturbance", "mean"))
+
+plot(as.ts(log(dtts)))
+lines(smo1$muhat, col = "blue")
+plot(smo1$alphahat[1:28, "sea_dummy1"], type='b') # weekly seasonality
+```
+
+
+```{r}
+plot(as.numeric(dtts[1:length(dtts),]),type = "l", col='black')
+lines(exp(smo1$muhat[1:length(dtts),]), col='red')
+
+mae1_train <-mean(abs((dtts[1:days_to_add]) - exp(smo1$muhat[1:days_to_add,])), na.rm = TRUE)
+mae1 <- mean(abs((dtts[days_to_add:length(dtts)]) - exp(smo1$muhat[days_to_add:length(dtts),])), na.rm = TRUE)
+
+cat("Il MAE sul train set del modello 1 è:", mae1_train, "\n") # 6.44
+cat("Il MAE sul test set del modello 1 è:", mae1, "\n") # 8.69
+```
+
+
+#### Model 2 with annual seasonality
+
+
+```{r}
+mod2 <- SSModel(
+  log(dtts_training) ~ SSMtrend(2, list(NA, NA))+SSMseasonal(7, NA, 'trigonometric')+SSMcycle(20, NA, damping=0.9 ),
+  H = NA
+)
+
+mod2$P1inf[9,9] <- mod2$P1inf[10,10] <- 0
+```
+
+#### Definition of the logit function
+
+```{r}
+logit <- function(x, a = 0, b = 1) {
+  a + (b-a)/(1+exp(-x))
+}
+```
+
+
+
+```{r}
+
+inits2 <- c(
+  log_var_eta = log(var_ldtts/10),
+  log_var_zeta = log(var_ldtts/100),
+  log_var_kappa = log(var_ldtts/10),
+  log_var_eps = log(var_ldtts/10),
+  ilogit_rho = 2.5,
+  ilogit_period = 0.5, # period of 1034 days --> around 3 years
+  log_var_omega = log(var_ldtts/100)
+)
+
+
+updt2 <- function(pars, model) {
+  nq <- nrow(model$Q[,,1])
+  rho <- logit(pars[5])
+  lambda <- 2*pi / logit(pars[6], 30, 120)  # = frequency / period
+  var_kappa <- exp(pars[3]) # variance of the noise of the cycle kappa
+  var_psi <- var_kappa / (1 - rho^2) # variance of the cycle
+  co <- cos(lambda)*rho
+  si <- sin(lambda)*rho
+  model$T[9, 9, 1] <- model$T[10, 10, 1] <- co # third and fourth diagonal component of the T matrix in the state equations are cosine
+  model$T[9, 10, 1] <- si # the component at position (3,4) of the T matrix is the sine
+  model$T[10, 9, 1] <- -si # this is the negative of the sine
+  model$Q[1, 1, 1] <- exp(pars[1]) # variance of the noise of the level
+  model$Q[2, 2, 1] <- exp(pars[2]) # variance of the noise of the slope
+  model$Q[9, 9, 1] <- model$Q[10, 10, 1] <- var_kappa # variance of the noise of the cycle
+  model$P1[9, 9] <- model$P1[10, 10] <- var_psi # marginal variance (no error terms) of the cycle
+  diag(model$Q[3:nq-2, 3:nq-2, 1]) <- exp(pars[7]) # variance of the noise of the seasonality
+  model$H[1, 1, 1] <- exp(pars[4])
+  model
+}
+
+fit2 <- fitSSM(mod2, inits2, updt2)
+```
+
+
+
+```{r}
+# smoothing
+smo2 <- KFS(fit2$model,
+  smoothing = c("state", "signal", "disturbance", "mean"))
+
+plot(as.ts(log(dtts_training)))
+lines(smo2$alphahat[,"cycle"], col = "blue")
+```
+
+```{r}
+plot(as.numeric(dtts[1:length(dtts),]),type = "l", col='black')
+lines(exp(smo2$muhat[1:length(dtts),]), col='red')
+
+mae2_train <-mean(abs((dtts[1:days_to_add]) - exp(smo2$muhat[1:days_to_add,])), na.rm = TRUE)
+mae2 <- mean(abs((dtts[days_to_add:length(dtts)]) - exp(smo2$muhat[days_to_add:length(dtts),])), na.rm = TRUE)
+
+cat("Il MAE sul train set del modello 1 è:", mae2_train, "\n") # 3.49
+cat("Il MAE sul test set del modello 1 è:", mae2, "\n") # 24.91
+```
+
+```{r}
+fit2$optim.out
+exp(fit2$optim.out$par)
+```
+
+# We take the first model, the best performing one so far, and analyze its shocks on level, slope and seasonality disturbances
+# respectively.
+
+```{r}
+plot(smo1$etahat)
+```
+
+# We can see that there is no variability for any of the disturbances, as they are all zero.
+
+# Let's now double check it using auxiliary residuals.
+
+```{r}
+add_outliers = rstandard(smo1, "pearson")
+dist_shocks = rstandard(smo1, "state")
+```
+
+
+```{r}
+plot(dist_shocks[, 'slope'])
+abline(h = qnorm(c(0.005, 0.995)), lty = 2)
+
+extreme_ndx <- which.max(abs(dist_shocks[, "level"]))
+extreme_date <- start_date + extreme_ndx
+extreme_date # 24 09 2008 most extreme change in level (not at the very beginning of the time series) taking effect the following day
+# 06 01 2007 considering the beginning of the time series (07 01 2007 for the slope instead)
+```
+
+
+#### Adding a step function the most abrupt change in auxiliary residuals
+
+```{r}
+step <- dtts
+step[] <- 0
+step[(extreme_ndx+1):length(step)] <- 1
+
+pulse <- dtts
+pulse[] <- 0
+pulse[extreme_ndx+1] <- 1
+```
+
+
+```{r}
+mod3 <- SSModel(
+  log(dtts_training) ~ 0 + step + pulse + SSMtrend(2, list(NA, NA)) +
+    SSMseasonal(7, NA),
+  H = NA
+)
+
+fit3 <- fitSSM(
+  model = mod3,
+  inits= fit1$optim.out$par
+)
+
+smo3 <- KFS(fit3$model,
+  smoothing = c("state", "signal", "disturbance", "mean"))
+
+```
+
+
+```{r}
+plot(as.numeric(dtts[1:length(dtts),]),type = "l", col='black')
+lines(exp(smo3$muhat[1:length(dtts),]), col='red')
+
+mae3_train <-mean(abs((dtts[1:days_to_add]) - exp(smo3$muhat[1:days_to_add,])), na.rm = TRUE)
+mae3 <- mean(abs((dtts[days_to_add:length(dtts)]) - exp(smo3$muhat[days_to_add:length(dtts),])), na.rm = TRUE)
+
+cat("Il MAE sul train set del modello 1 è:", mae3_train, "\n") # 6.46
+cat("Il MAE sul test set del modello 1 è:", mae3, "\n") # 8.
+```
+
+
+# The performance did not improve
+
+
+# Given the auxiliary residuals, we might later want to add dummy regressorss for the Epiphany week and the weeek from 20-25 Sept
+
+
+```{r}
+dum <- readxl::read_xlsx("elettrodummies_extended_training.xlsx") # file that contains national holiday from 2007 to 2015
+
+dumts <- xts(dum[, -(1)],
+             as.Date(dum$Date,
+                     format = "%Y/%m/%d")) ["2007-01-04/"]
+data <- merge(dtts, dumts, join = "inner")
+data <- merge(data, dtts_training)
+#data$DayOfWeek <- ifelse(data$DayOfWeek==6 | data$DayOfWeek==7,1,0)
+
+```
+
+# Retrieving only the part relevant to the training set from the dummy matrix
+
+```{r}
+training_date <- as.Date("2013-03-08")
+
+# Subset your xts object to include only data until March 8th, 2013
+dumts_training <- subset(dumts, index(dumts) <= training_date)
+```
+
+
+#### I tuned the model to determine which dummy covariates were more useful. Turns out only 7 of them were helping the model.
+
+# I have also kept only those ones from the original Excel file.
+
+```{r}
+mod4 <- SSModel(
+  log(dtts_training) ~ Dec25+Dec26+Jan1+Jan6+EasterSat+EasterSun+EasterMon+
+    SSMtrend(2, list(NA,NA))+
+                  SSMseasonal(7,NA, 'trig'),
+                H = NA,
+  data=data
+)
+
+
+updt4 <- function(pars, model) {
+  nq <- nrow(model$Q[,,1])
+  model$Q[1, 1, 1] <- exp(pars[1])
+  model$Q[2, 2, 1] <- exp(pars[2])
+  diag(model$Q[3:nq, 3:nq, 1]) <- exp(pars[3])
+  model$H[1, 1, 1] <- exp(pars[4])
+  model
+}
+
+fit4 <- fitSSM(mod4, fit1$optim.out$par, updt4, control=list(maxit=1000)) #fit1 is the best performing so far
+fit4$optim.out
+
+smo4 <- KFS(fit4$model,
+            smoothing = c('state', 'signal', 'disturbance', 'mean'))
+```
+
+
+```{r}
+plot(as.numeric(dtts[1:length(dtts),]),type = "l", col='black')
+lines(exp(smo3$muhat[1:length(dtts),]), col='red')
+
+mae4_train <-mean(abs((dtts[1:days_to_add]) - exp(smo4$muhat[1:days_to_add,])), na.rm = TRUE)
+mae4 <- mean(abs((dtts[days_to_add:length(dtts)]) - exp(smo4$muhat[days_to_add:length(dtts),])), na.rm = TRUE)
+
+cat("Il MAE sul train set del modello 4 è:", mae4_train, "\n") # 6.24
+cat("Il MAE sul test set del modello 4 è:", mae4, "\n") # 8.48
+```
+
+# Extending the time series until 2015-11-07.
+
+```{r}
+dt_test <- data.frame(date=seq(as.Date("2015-04-01"), as.Date("2015-11-07"), by="day"), ave_days=NA)
+y_test<- xts(dt_test$ave_days, order.by=dt_test$date,  frequency=365.25)
+complete_ts<-rbind(data$dtts, y_test)
+```
+
+# Add regressors until 2015-11-07
+
+```{r}
+dum_test <- readxl::read_xlsx("elettrodummies_extended.xlsx") # file that contains national holiday from 2007 to 2015
+
+dumts_test <- xts(dum_test[, -(1)],
+             as.Date(dum_test$Date,
+                     format = "%d/%m/%Y"))
+dumts_test <- subset(dumts_test) ["2007-01-04/"]
+all_data <- merge(dtts, dumts_test)
+# all_data <- merge(all_data, dtts_training, all=TRUE)
+# data$DayOfWeek <- ifelse(data$DayOfWeek==6 | data$DayOfWeek==7,1,0)
+```
+
+
+#### Training the best model 'mod4' also on the validation set to check whether it is beneficial.
+
+```{r warning=FALSE}
+mod_def_ss <- SSModel(
+  log(complete_ts) ~ Dec25+Dec26+Jan1+Jan6+EasterSat+EasterSun+EasterMon+
+    SSMtrend(2, list(NA,NA))+
+                  SSMseasonal(7,NA, 'trig'),
+                H = NA,
+  data=all_data
+)
+
+fit_def_ss <- fitSSM(mod_def_ss, fit1$optim.out$par, updt4, control=list(maxit=1000))
+fit_def_ss$optim.out
+
+smo_def_ss <- KFS(fit_def_ss$model,
+            smoothing = c('state', 'signal', 'disturbance', 'mean'))
+```
+
+# Comparing the same model trained only on training set (red) ad also on validation set (blue).
+
+```{r}
+plot(as.ts(log(dtts_training)), xlim = c(0,nrow(all_data)))
+lines(smo4$alphahat[, "level"], col = "red")# trend of model 1
+lines(smo_def_ss$alphahat[, "level"], col = "blue") #real trend estimated
+
+```
+
+```{r}
+plot(as.numeric(dtts[1:length(dtts),]),type = "l", col='black', xlim = c(0,nrow(all_data)))
+lines(exp(smo_def_ss$muhat), col='red')
+
+mae_def_ss_train <-mean(abs((dtts[1:length(dtts)]) - exp(smo_def_ss$muhat[1:length(dtts),])), na.rm = TRUE)
+
+cat("Il MAE sul train set del modello definitivo state space è:", mae_def_ss_train, "\n") # 6.61
+
+
+```
+
+
+```{r}
+inference_ss <- exp(smo_def_ss$muhat[(length(dtts)+1):nrow((all_data))])
+
+boxplot(dtts)
+boxplot(inference_ss)
+
+summary(dtts)
+summary(inference_ss)
+```
+#### Store the predictions in an Excel file
+
+```{r}
+dt_ss <- data.frame(Index=index(all_data[3010:nrow(all_data)]), UCM=inference_ss)
+write.csv(dt_ss, file = 'predictionSS.csv', row.names=FALSE)
+```
+
+
+#### Impute missing values (originally with smo_def_ss)
+
+# Imputing missing values with model trained also on validation deteriorates the model by a lot
+
+```{r}
+for (i in seq_along(dtts)) {
+  dtts[i] <- ifelse(is.na(dtts[i]), exp(smo4$muhat[i,]), dtts[i])
+}
+```
+
+# Save the imputed data externally
+
+```{r}
+dt_new <- data.frame(index(dtts), ave_days=dtts)
+
+write.csv(dt_new, file = "dt_new.csv", row.names = FALSE)
+```
+
+
+
+#### ARIMA MODELS
+
+# I update dtts_training and create dtts_test
+
+```{r}
+dtts_training = dtts[0:days_to_add]
+dtts_test = dtts[(days_to_add+1):length(dtts)]
+```
+
+# Checking the stationarity of the time series.
+
+```{r}
+library(urca)
+plot(diff(log(dtts_training), 7))
+summary(ur.df(na.omit(diff(log(dtts_training), 7),"drift", 7, "AIC")))
+```
+
+# From the Dickey- Fouller test, we are rejecting the null hypothesis of presence of unit root, therefore we can consider our time series stationary in mean and proceed witht he estimation of the model.
+
+# Since we took a seasonal differencing, we know already that D=1 in model = (p,d,q)(P,D,Q). Since we took the logarithm, we put parameter lambda = 0, so that the inverse transform for inference will be made automatically
+
+# If I take a difference (seasonal or not), we must include it in the model as indicated above, and also the meaning of "include.drift" in "arima" function changes: the constant that stems from the integration (reverse operation of differencing) is the cause of the drift in the characteristic equation (CE). The contant wil also affect the calculation of mu, so the mean. Therefore adding "include.constant" overrides the meaning of both "include.drift" and "include.mean".
+
+# Let's now check ACF and PACF
+
+```{r}
+dtts_training |> log() |> diff(7) |> Acf(90) # we take three months
+dtts_training |> log() |> diff(7) |> Pacf(90)
+```
+# We can see that the process has memory as there are several peaks in residuals.
+# As the ACF decreases gradually, I would not consider an MA process. 
+# Let's try c(0,1,1) for the seasonal part because in the ACF the first r.e. is significant and also the first multiple of s=7. Also we performed a seasonal difference earlier.
+
+```{r}
+library(forecast)
+
+fit5 <- Arima(dtts_training,
+              c(0,0,1),
+              seasonal = list(order = c(0,1,1), period = 7),
+              include.constant = TRUE,
+              lambda=0)
+fit5$residuals |> Acf(90)
+fit5$residuals |> Pacf(90)
+```
+
+
+```{r}
+fit5 |> summary() # MAE train: 6.08
+```
+
+# Checking normality of residuals. As there is no right amount of lags, I test it at increasing amount of lags. I select the model that most consistently fails to reject the normality hypothesis H0.
+
+```{r}
+fit5$residuals |> Box.test(lag=30, "Ljung-Box", fitdf=3)
+fit5$residuals |> Box.test(lag=60, "Ljung-Box", fitdf=3)
+fit5$residuals |> Box.test(lag=365, "Ljung-Box", fitdf=3)
+```
+# All tests are rejected.
+
+# Forecasts
+
+```{r}
+h <- length(dtts_test)
+pre5 <- forecast(fit5, lambda = 0, h=h)
+
+autoplot(pre5)
+```
+
+
+# Loss function
+
+```{r}
+losses <- function(real, pred) {
+  error <- real - pred
+  ae <- abs(error)
+  se <- error^2
+  cat("ME: ", mean(error), "\t RMSE: ", sqrt(mean(se)), "\t MAE: ", mean(ae), "\t MPE: ", mean(error/real)*100, "\t MAPE: ", mean(ae/real)*100)
+}
+
+
+suppressWarnings(losses(dtts_test, pre5$mean)) # MAE test: 6.95 (6.08 on training set) with imputing outliers and missing values
+```
+
+# Visual overview
+
+```{r}
+autoplot(pre5)
+summary(dtts_test)
+boxplot(dtts_test)
+length(pre5$mean)
+summary(pre5$mean)
+boxplot(pre5$mean)
+```
+
+#### Using AUTO ARIMA to determine the suggested configuration of the model
+
+```{r}
+auto.arima(dtts, seasonal = TRUE, lambda=0)
+arimamod <- auto.arima(dtts,
+                       D = 1,
+                       seasonal = TRUE,
+                       lambda = 0, 
+                       ic = 'aic', 
+                       stepwise = FALSE, 
+                       trace = TRUE, 
+                       approximation = FALSE)
+
+```
+
+
+# Adopting the best suggested model
+
+```{r}
+fit6 <- Arima(dtts_training,
+              c(4,1,1),
+              seasonal = list(order = c(1,1,1), period = 7),
+              include.constant = TRUE,
+              lambda=0,
+              method='CSS')
+fit6$residuals |> Acf(365)
+fit6$residuals |> Pacf(365)
+```
+
+
+```{r}
+fit6 |> summary() # MAE train: 6.03 and AIC 4368
+```
+
+# Checking normality of residuals
+
+```{r}
+fit6$residuals |> Box.test(lag=30, "Ljung-Box", fitdf=7)
+fit6$residuals |> Box.test(lag=60, "Ljung-Box", fitdf=7)
+fit6$residuals |> Box.test(lag=365, "Ljung-Box", fitdf=7)
+```
+
+# Only the test with lags up to one year accepts the null hypothesis.
+
+# Forecasts
+
+```{r}
+pre6 <- forecast(fit6, lambda = 0, h=h)
+suppressWarnings(losses(dtts_test, pre6$mean)) # MAE on test set: 17.75
+```
+
+# MAE on test set is much larger than before, showing how it can be misleading to blindly follow "auto.arima" function, also because it is based on AIC and not on MAE.
+
+# Evidently, the non-seasonal differencing introduced a lot of noise that caused overfitting.
+
+# Starting from the plots of our best performing ARIMA model so far (fit5), we still see some significant r.e. on both the ACF and the PACF plot, for this reason we try to add some degrees of non-seasonal AR and MA process.
+
+
+# Visual overview
+
+```{r}
+autoplot(pre6)
+summary(dtts_test)
+boxplot(dtts_test)
+length(pre6$mean)
+summary(pre6$mean)
+boxplot(pre6$mean)
+```
+
+
+```{r}
+h <- length(dtts_test)
+fit7 <- Arima(dtts_training,
+              c(5,0,5),
+              seasonal = list(order = c(0,1,1), period = 7),
+              include.constant = TRUE,
+              lambda=0)
+fit7$residuals |> Acf(90)
+fit7$residuals |> Pacf(90)
+```
+
+
+```{r}
+fit7|> summary()
+```
+
+# Checking normality of residuals
+
+```{r}
+fit7$residuals |> Box.test(lag=30, "Ljung-Box", fitdf=11)
+fit7$residuals |> Box.test(lag=60, "Ljung-Box", fitdf=11)
+fit7$residuals |> Box.test(lag=365, "Ljung-Box", fitdf=11)
+```
+# We have successfully removed most of the significant lags, accepting the normality test at all the time spans.
+
+# Forecasts
+
+```{r}
+pre7 <- forecast(fit7, lambda = 0, h=h)
+suppressWarnings(losses(dtts_test, pre7$mean)) # MAE test: 6.8
+```
+# This model also performs better than 'fit5', with a MAE of 6.8, reducing overfitting.
+
+# Visual overview
+
+```{r}
+autoplot(pre7)
+summary(dtts_test)
+boxplot(dtts_test)
+length(pre7$mean)
+summary(pre7$mean)
+boxplot(pre7$mean)
+```
+
+# I turn my attention to the seasonal AR process, to check whether it is beneficial to introduce it.
+
+```{r}
+fit8 <- Arima(dtts_training,
+              c(5,0,5),
+              seasonal = list(order = c(1,1,1), period = 7),
+              include.constant = TRUE,
+              lambda=0)
+summary(fit8)
+fit8$residuals |> Acf(90)
+fit8$residuals |> Pacf(90)
+```
+
+# Checking normality of residuals
+
+```{r}
+fit8$residuals |> Box.test(lag=30, "Ljung-Box", fitdf=12)
+fit8$residuals |> Box.test(lag=60, "Ljung-Box", fitdf=12)
+fit8$residuals |> Box.test(lag=365, "Ljung-Box", fitdf=12)
+```
+
+# Judging by the p-value, we fail to reject the null hypothesis and we can consider the residuals a white noise on a 1 year time interval. Unfortunately, on the 1 month and 2 months interval there are still a few large spikes that reject the null hypothesis.
+
+
+# Forecasts
+
+```{r}
+pre8 <- forecast(fit8, lambda = 0, h=h)
+suppressWarnings(losses(dtts_test, pre8$mean))
+```
+# As expected, seasonal AR was not visible from the autocorrelation plots and is indeed introducing much more residual memory.
+
+# Therefore the most robust model (with lower residual memory) appears to be 'fit7', which also has a performance close to the best model (fit8). Hence, I will use this for imputation.
+
+# Visual overview
+
+```{r}
+autoplot(pre8)
+summary(dtts_test)
+boxplot(dtts_test)
+length(pre8$mean)
+summary(pre8$mean)
+boxplot(pre8$mean)
+```
+
+
+# Attempting to add dummy regressors within ARIMAX
+
+
+# By testing several models with annual seasonality, we have proven that there is underfitting of the model, deteriorating the performance on both training and validation set. Furthermore, the Box-test is rejected at 5% significance level at any time interval.
+
+# This is a clear indication that we shall remove the annual seasonality regressors, and try to leave only the dummy regressors for the holidays.
+
+```{r}
+fit11 <- Arima(dtts_training, # alla fine valida il modello allenandolo anche sul validation set
+              order = c(5, 0, 5),
+              seasonal = list(order = c(0, 1, 1), period = 7),
+              dumts_training,
+              include.drift = TRUE,
+              lambda = 0,
+              method = "CSS" # prova a togliere questo
+)
+
+summary(fit11)
+
+```
+
+
+```{r}
+checkresiduals(fit11)
+fit11$residuals |> Box.test(lag=30, "Ljung-Box", fitdf=18)
+fit11$residuals |> Box.test(lag=60, "Ljung-Box", fitdf=18)
+fit11$residuals |> Box.test(lag=365, "Ljung-Box", fitdf=18)
+```
+
+# Forecasts
+
+```{r}
+dumts_test_arima = subset(dumts_test) ["2013-03-09/2015-03-31"]
+pre11 <- forecast(fit11, lambda = 0, xreg = dumts_test_arima)
+suppressWarnings(losses(dtts_test, pre11$mean)) # 7.17
+```
+
+# Visual overview
+
+```{r}
+autoplot(pre11)
+summary(dtts_test)
+boxplot(dtts_test)
+length(pre11$mean)
+summary(pre11$mean)
+boxplot(pre11$mean)
+```
+
+# Although there is a slight improvement by removing the annual seasonality, the dummy regressors still deteriorate the model with respect to the best benchmark 'fit7'.
+
+
+
+
+#### INFERENCE ON ALL DATA
+
+# Extending the test time series until December 31st 2015 and create a new xts object with NAs for the extended period
+
+
+```{r}
+new_dates <- seq(index(tail(dtts_test, 1))+1, as.Date("2015-11-07"), by = "days")
+extended_xts <- xts(rep(NA, length(new_dates)), order.by = new_dates)
+all_dtts_test <- merge(dtts_test, extended_xts)
+all_dtts_test <- all_dtts_test[, !(colnames(all_dtts_test) %in% c("extended_xts"))]
+```
+
+# Final forecasts
+
+```{r}
+fit_def_arima <- Arima(dtts,
+              c(5,0,5),
+              seasonal = list(order = c(0,1,1), period = 7),
+              include.constant = TRUE,
+              lambda=0)
+fit_def_arima$residuals |> Acf(90)
+fit_def_arima$residuals |> Pacf(90)
+fit_def_arima|> summary()
+
+```
+
+
+```{r warning=FALSE}
+h <- length(extended_xts)
+pre_def_arima <- forecast(fit_def_arima, lambda = 0, h=h)
+```
+
+# Checking normality of residuals
+
+
+```{r}
+fit_def_arima$residuals |> Box.test(lag=30, "Ljung-Box", fitdf=11)
+fit_def_arima$residuals |> Box.test(lag=60, "Ljung-Box", fitdf=11)
+fit_def_arima$residuals |> Box.test(lag=365, "Ljung-Box", fitdf=11)
+```
+
+# The results of the Box test have now drastically changed, as it barely accepts the null hypothesis on one year time interval and rejects the other ones. After careful consideration, it seems unwise to resort to the validation set for training the models.
+
+
+# Visual overview
+
+```{r}
+autoplot(pre_def_arima)
+summary(dtts_test)
+boxplot(dtts_test)
+length(pre_def_arima$mean)
+summary(pre_def_arima$mean)
+boxplot(pre_def_arima$mean)
+```
+
+#### INFERENCE ON ARIMA
+
+# Training the model on the validation set has proven to be detrimental both for state space models and arima models, in terms of MAE, missing value imputation and Box.test (for ARIMA models).
+
+# Consequently, the best option is to train the model on the training set only. The best performing model therefore is 'fit8'.
+
+```{r}
+pre_arima <- forecast(fit_def_arima, lambda = 0, h=h)
+```
+
+# Visual overview
+
+```{r}
+autoplot(pre_arima)
+
+inference_arima <- pre_arima$mean
+
+summary(dtts_test)
+boxplot(dtts_test)
+length(inference_arima)
+summary(inference_arima)
+boxplot(inference_arima)
+```
+
+```{r}
+summary(dtts)
+summary(inference_ss)
+summary(inference_arima)
+```
+
+#### Store the predictions in an Excel file
+
+```{r}
+dt_arima <- data.frame(index=index(all_dtts_test[754:nrow(all_dtts_test)]), ARIMA=inference_arima)
+write.csv(dt_arima, file = 'predictionARIMA.csv', row.names=FALSE)
+```
+
